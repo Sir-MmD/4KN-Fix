@@ -175,45 +175,77 @@ dmesg_has_uas_errors() {
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Globals set by select_device()
-SEL_VID="" SEL_PID="" SEL_NAME="" SEL_IFACE="" SEL_BLOCK=""
+SEL_VID="" SEL_PID="" SEL_NAME="" SEL_IFACE="" SEL_BLOCK="" SEL_DRIVER=""
 
 select_device() {
-    banner "Scanning for UAS Devices"
+    banner "Scanning for USB Storage Devices"
 
-    # Collect UAS-bound interfaces
-    mapfile -t UAS_IFACES < <(list_driver_ifaces uas)
+    # Collect interfaces from both UAS and usb-storage drivers
+    declare -A _VID _PID _NAME _IFACE _BLOCK _DRIVER
+    local i=1
 
-    if [[ ${#UAS_IFACES[@]} -eq 0 ]]; then
-        warn "No UAS-bound devices found right now."
+    for drv in uas usb-storage; do
+        mapfile -t DRV_IFACES < <(list_driver_ifaces "$drv")
+        for iface in "${DRV_IFACES[@]}"; do
+            local info; info=$(usb_info "$iface")
+            local vidpid="${info%%|*}"
+            local name="${info##*|}"
+            local vid="${vidpid%%:*}" pid="${vidpid##*:}"
+            local blk; blk=$(block_dev_for_iface "$iface")
+
+            _VID[$i]="$vid"; _PID[$i]="$pid"; _NAME[$i]="$name"
+            _IFACE[$i]="$iface"; _BLOCK[$i]="${blk:-}"; _DRIVER[$i]="$drv"
+            ((i++)) || true
+        done
+    done
+
+    if (( i == 1 )); then
+        warn "No USB storage devices found."
         echo
         echo "  Possible reasons:"
-        echo "  • Drive is already fixed or not using UAS"
         echo "  • Drive is not plugged in"
-        echo "  • Drive disconnected due to UAS errors — replug and re-run"
+        echo "  • Drive disconnected due to errors — replug and re-run"
         echo
         exit 0
     fi
 
-    echo -e "${BOLD}Detected UAS device(s):${RESET}\n"
+    echo -e "${BOLD}Detected USB storage device(s):${RESET}\n"
 
-    declare -A _VID _PID _NAME _IFACE _BLOCK
-    local i=1
+    local n
+    for (( n=1; n<i; n++ )); do
+        local vid="${_VID[$n]}" pid="${_PID[$n]}" name="${_NAME[$n]}"
+        local iface="${_IFACE[$n]}" blk="${_BLOCK[$n]}" drv="${_DRIVER[$n]}"
 
-    for iface in "${UAS_IFACES[@]}"; do
-        local info; info=$(usb_info "$iface")
-        local vidpid="${info%%|*}"
-        local name="${info##*|}"
-        local vid="${vidpid%%:*}" pid="${vidpid##*:}"
-        local blk; blk=$(block_dev_for_iface "$iface")
-
-        # Error badge
+        # Status badge
         local badge=""
-        if [[ -n "$blk" ]] && dmesg_has_uas_errors "$blk"; then
-            badge=" ${RED}[UAS errors]${RESET}"
+        if [[ "$drv" == "uas" ]]; then
+            badge=" ${YELLOW}[UAS]${RESET}"
+            if [[ -n "$blk" ]] && dmesg_has_uas_errors "$blk"; then
+                badge=" ${RED}[UAS errors]${RESET}"
+            fi
+        else
+            # Check if any partitions are unmounted
+            local has_unmounted=false
+            if [[ -n "$blk" && -b "/dev/$blk" ]]; then
+                while IFS= read -r pline; do
+                    local pname pfs pmnt
+                    pname=$(echo "$pline" | awk '{print $1}')
+                    pfs=$(echo "$pline" | awk '{print $2}')
+                    pmnt=$(echo "$pline" | awk '{print $3}')
+                    if [[ -n "$pfs" && "$pfs" != "swap" && ( -z "$pmnt" || "$pmnt" == "-" ) ]]; then
+                        has_unmounted=true; break
+                    fi
+                done < <(lsblk -rno NAME,FSTYPE,MOUNTPOINT "/dev/$blk" 2>/dev/null | tail -n +2)
+            fi
+            if $has_unmounted; then
+                badge=" ${YELLOW}[not mounted]${RESET}"
+            else
+                badge=" ${GREEN}[ok]${RESET}"
+            fi
         fi
 
-        echo -e "  ${BOLD}[$i]${RESET} ${CYAN}${name:-Unknown device}${RESET} (${vidpid})${badge}"
-        echo -e "       Interface : $iface"
+        echo -e "  ${BOLD}[$n]${RESET} ${CYAN}${name:-Unknown device}${RESET} (${vid}:${pid})${badge}"
+        echo -e "       Interface : $iface   Driver: $drv"
 
         if [[ -n "$blk" && -b "/dev/$blk" ]]; then
             local size phy log
@@ -227,13 +259,9 @@ select_device() {
                 echo -e "       Type      : 512e (4K physical, 512 logical emulation)"
             fi
         else
-            echo -e "       Block dev : ${YELLOW}not visible${RESET} (UAS init failed)"
+            echo -e "       Block dev : ${YELLOW}not visible${RESET} (init failed)"
         fi
         echo
-
-        _VID[$i]="$vid"; _PID[$i]="$pid"; _NAME[$i]="$name"
-        _IFACE[$i]="$iface"; _BLOCK[$i]="${blk:-}"
-        ((i++)) || true
     done
 
     echo -e "  ${BOLD}[0]${RESET} Exit\n"
@@ -245,14 +273,14 @@ select_device() {
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
             SEL_VID="${_VID[$choice]}"   SEL_PID="${_PID[$choice]}"
             SEL_NAME="${_NAME[$choice]}" SEL_IFACE="${_IFACE[$choice]}"
-            SEL_BLOCK="${_BLOCK[$choice]}"
+            SEL_BLOCK="${_BLOCK[$choice]}" SEL_DRIVER="${_DRIVER[$choice]}"
             break
         fi
         warn "Invalid selection."
     done
 
     echo
-    log "Selected: ${SEL_NAME} (${SEL_VID}:${SEL_PID})"
+    log "Selected: ${SEL_NAME} (${SEL_VID}:${SEL_PID})  driver: ${SEL_DRIVER}"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -416,7 +444,17 @@ fix_ntfs() {
     for part in "${ntfs_parts[@]}"; do
         local pdev="/dev/$part"
         [[ -b "$pdev" ]] || continue
+        # Check if already mounted — skip ntfsfix for mounted partitions
+        local pmnt
+        pmnt=$(lsblk -dno MOUNTPOINT "$pdev" 2>/dev/null)
+        if [[ -n "$pmnt" && "$pmnt" != "-" ]]; then
+            ok "$pdev already mounted at $pmnt — skipping ntfsfix"
+            continue
+        fi
         log "Running ntfsfix on $pdev ..."
+        if ntfsfix -d "$pdev"; then
+            ok "$pdev: dirty flag cleared"
+        fi
         if ntfsfix "$pdev"; then
             ok "$pdev repaired"
         else
@@ -503,12 +541,32 @@ print_summary() {
     banner "Summary"
     echo -e "  Device    : ${BOLD}${SEL_NAME}${RESET}  (${SEL_VID}:${SEL_PID})"
     echo -e "  Interface : $SEL_IFACE"
+    echo -e "  Driver    : $SEL_DRIVER"
     [[ -n "$SEL_BLOCK" ]] && echo -e "  Block dev : ${GREEN}/dev/$SEL_BLOCK${RESET}"
+
+    # Show mount status for partitions
+    if [[ -n "$SEL_BLOCK" && -b "/dev/$SEL_BLOCK" ]]; then
+        echo
+        while IFS= read -r line; do
+            local pname pfs pmnt
+            pname=$(echo "$line" | awk '{print $1}')
+            pfs=$(echo "$line" | awk '{print $2}')
+            pmnt=$(echo "$line" | awk '{$1=""; $2=""; print}' | sed 's/^ *//')
+            [[ -z "$pfs" ]] && continue
+            if [[ -n "$pmnt" && "$pmnt" != "-" ]]; then
+                echo -e "  Partition : ${GREEN}/dev/$pname${RESET} → $pmnt"
+            else
+                echo -e "  Partition : ${YELLOW}/dev/$pname${RESET} (not mounted)"
+            fi
+        done < <(lsblk -rno NAME,FSTYPE,MOUNTPOINT "/dev/$SEL_BLOCK" 2>/dev/null | tail -n +2)
+    fi
+
     echo
-    echo -e "  ${GREEN}Runtime fix${RESET}   : active — UAS disabled, usb-storage active"
-    echo -e "  ${GREEN}Permanent fix${RESET} : /etc/modprobe.d/usb-storage-quirks.conf"
-    echo
-    warn "On next plug-in the drive will automatically use usb-storage (no further steps needed)."
+    if [[ -f /etc/modprobe.d/usb-storage-quirks.conf ]] && \
+       grep -q "${SEL_VID}:${SEL_PID}" /etc/modprobe.d/usb-storage-quirks.conf 2>/dev/null; then
+        echo -e "  ${GREEN}Permanent fix${RESET} : /etc/modprobe.d/usb-storage-quirks.conf"
+        warn "On next plug-in the drive will automatically use usb-storage (no further steps needed)."
+    fi
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -528,8 +586,27 @@ BANNER
     detect_distro
     install_deps
     select_device
-    apply_runtime_fix
-    make_permanent
+
+    if [[ "$SEL_DRIVER" == "uas" ]]; then
+        apply_runtime_fix
+        make_permanent
+    else
+        ok "Device already using usb-storage (UAS fix not needed)"
+        # Still offer to make the quirk permanent if not already done
+        local quirk_conf="/etc/modprobe.d/usb-storage-quirks.conf"
+        local vidpid="${SEL_VID}:${SEL_PID}"
+        if [[ -f "$quirk_conf" ]] && grep -q "$vidpid" "$quirk_conf"; then
+            ok "Permanent quirk already in place for $vidpid"
+        else
+            echo
+            ask "Save permanent UAS quirk for ${SEL_NAME}? [Y/n]:"; read -r yn
+            case "${yn,,}" in
+                n|no) log "Skipping permanent quirk." ;;
+                *)    make_permanent ;;
+            esac
+        fi
+    fi
+
     fix_ntfs
 
     echo
