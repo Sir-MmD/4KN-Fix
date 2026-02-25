@@ -31,6 +31,20 @@ err()    { printf '%s[✗]%s %s\n' "$RED" "$RESET" "$*" >&2; }
 die()    { err "$*"; exit 1; }
 banner() { printf '\n%s%s─── %s ───%s\n\n' "$BOLD" "$CYAN" "$*" "$RESET"; }
 
+# Interactive read: reads from /dev/tty when stdin isn't a terminal (e.g. curl|bash).
+# Exits gracefully if /dev/tty is also unavailable.
+# Sets the variable named by $1 to the user's input.
+prompt_read() {
+    local -n _prompt_ref="$1"
+    if [[ -t 0 ]]; then
+        IFS= read -r _prompt_ref
+    elif { true </dev/tty; } 2>/dev/null; then
+        IFS= read -r _prompt_ref </dev/tty
+    else
+        die "No interactive terminal available. Download the script and run it directly."
+    fi
+}
+
 # ─── Temp files & cleanup ──────────────────────────────────────────────────
 TMPDIR_4KN=""
 
@@ -537,7 +551,7 @@ select_drive() {
 
         local choice
         printf '  Select a drive [0-%d]: ' "$DRIVE_COUNT"
-        read -r choice
+        prompt_read choice
 
         if [[ "$choice" == "0" ]]; then
             log "Exiting."
@@ -815,7 +829,7 @@ run_action_menu() {
 
         local choice
         printf '  Select action [0-%d]: ' "${#ACTIONS[@]}"
-        read -r choice
+        prompt_read choice
 
         if [[ "$choice" == "0" ]]; then
             echo
@@ -998,7 +1012,8 @@ action_fix_uas() {
         if (( attempt < 3 )); then
             warn "Device not ready yet."
             printf '  Replug the drive now, then press Enter to retry (Ctrl+C to abort): '
-            read -r _
+            local _discard
+            prompt_read _discard
         fi
     done
 
@@ -1093,7 +1108,7 @@ action_repair_fs() {
             warn "$pdev is mounted at $pmnt — must unmount before repair."
             printf '  Unmount %s? [y/N]: ' "$pdev"
             local yn
-            read -r yn
+            prompt_read yn
             if [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]]; then
                 if umount "$pdev" 2>/dev/null; then
                     ok "Unmounted $pdev"
@@ -1109,7 +1124,7 @@ action_repair_fs() {
 
         printf '  Repair %s (%s)? [Y/n]: ' "$pdev" "$fs"
         local yn
-        read -r yn
+        prompt_read yn
         if [[ "${yn,,}" == "n" || "${yn,,}" == "no" ]]; then
             log "Skipping $pdev."
             continue
@@ -1158,7 +1173,7 @@ action_repair_fs() {
                     warn "$pdev: btrfs check found issues."
                     printf '  Run btrfs check --repair? This is %sDESTRUCTIVE%s if it fails. [y/N]: ' "$RED" "$RESET"
                     local yn2
-                    read -r yn2
+                    prompt_read yn2
                     if [[ "${yn2,,}" == "y" ]]; then
                         btrfs check --repair "$pdev" && ok "$pdev: repaired" || err "$pdev: repair failed"
                     fi
@@ -1175,7 +1190,7 @@ action_repair_fs() {
                     warn "$pdev: xfs_repair found issues."
                     printf '  Run xfs_repair (may need -L for dirty log)? [y/N]: '
                     local yn2
-                    read -r yn2
+                    prompt_read yn2
                     if [[ "${yn2,,}" == "y" ]]; then
                         xfs_repair "$pdev" && ok "$pdev: repaired" || {
                             warn "Trying xfs_repair -L (force log zeroing)..."
@@ -1414,7 +1429,7 @@ action_run_all() {
     echo
     printf '  Proceed? [Y/n]: '
     local yn
-    read -r yn
+    prompt_read yn
     if [[ "${yn,,}" == "n" || "${yn,,}" == "no" ]]; then
         log "Cancelled."
         return 0
@@ -1427,7 +1442,7 @@ action_run_all() {
         if action_fix_uas; then
             echo
             printf '  Also make UAS fix permanent? [Y/n]: '
-            read -r yn
+            prompt_read yn
             if [[ "${yn,,}" != "n" && "${yn,,}" != "no" ]]; then
                 action_permanent_uas
             fi
